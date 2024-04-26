@@ -5,6 +5,8 @@ from catsample import sample_categorical
 
 from model import utils as mutils
 
+from tqdm import trange
+
 _PREDICTORS = {}
 
 
@@ -65,12 +67,32 @@ class EulerPredictor(Predictor):
         rev_rate = step_size * dsigma[..., None] * self.graph.reverse_rate(x, score)
         x = self.graph.sample_rate(x, rev_rate)
         return x
+    
+@register_predictor(name="BirthDeath")
+class BirthDeathCorrector(Predictor):
+    def update_fn(self, score_fn, x, t, step_size):
+        sigma, dsigma = self.noise(t)
+        score = score_fn(x, sigma)
+
+        rate = step_size * dsigma[..., None] * self.graph.rate(x)
+        rev_rate = step_size * dsigma[..., None] * self.graph.reverse_rate(x, score)
+        x = self.graph.sample_rate(x, rev_rate + rate)
+        return x
+    
+@register_predictor(name="Barker")
+class BarkerCorrector(Predictor):
+    def update_fn(self, score_fn, x, t, step_size):
+        raise NotImplementedError
+    
+@register_predictor(name="MPF")
+class MPFCorrector(Predictor):
+    def update_fn(self, score_fn, x, t, step_size):
+        raise NotImplementedError
 
 @register_predictor(name="none")
 class NonePredictor(Predictor):
     def update_fn(self, score_fn, x, t, step_size):
         return x
-
 
 @register_predictor(name="analytic")
 class AnalyticPredictor(Predictor):
@@ -119,8 +141,10 @@ def get_sampling_fn(config, graph, noise, batch_dims, eps, device):
     return sampling_fn
     
 
-def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
+def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x,
+                   corrector_type=None, corrector_entry_time=.9, num_corrector_steps=2, corrector_step_size_multiplier=.1):
     predictor = get_predictor(predictor)(graph, noise)
+    corrector = None if not corrector_type else get_predictor(corrector_type)(graph, noise)
     projector = proj_fun
     denoiser = Denoiser(graph, noise)
 
@@ -131,11 +155,16 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
         timesteps = torch.linspace(1, eps, steps + 1, device=device)
         dt = (1 - eps) / steps
 
-        for i in range(steps):
+        for i in trange(steps):
             t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
             x = projector(x)
             x = predictor.update_fn(sampling_score_fn, x, t, dt)
             
+            if corrector is not None and timesteps[i] <= corrector_entry_time:
+                for _ in range(num_corrector_steps):
+                    x = projector(x)
+                    x = corrector.update_fn(sampling_score_fn, x, t, dt * corrector_step_size_multiplier)
+
 
         if denoise:
             # denoising step
